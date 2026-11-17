@@ -1,54 +1,164 @@
-import os
+import json
+import re
+from pathlib import Path
+
 import joblib
-import numpy as np
 import pandas as pd
-import plotly.express as px
+import requests
 import streamlit as st
 
-st.set_page_config(page_title="Predictor de Severidad", page_icon="🛡️", layout="wide")
-st.title("🛡️ Predicción de Vulnerabilidades en Software")
+st.set_page_config(page_title="Escáner de repositorios (simulación)", page_icon="🛡️", layout="wide")
 
-MODEL_PATH = "vulnerability_model.joblib"
-if not os.path.exists(MODEL_PATH):
-    st.error("Ejecuta primero 'python entrenar_modelo.py' para generar el archivo 'vulnerability_model.joblib'.")
-    st.stop()
+MAX_VULNS = 40  # limite para que la demo sea rapida
 
-bundle = joblib.load(MODEL_PATH)
+
+@st.cache_resource
+def cargar_modelo():
+    ruta = Path(__file__).parent / "vulnerability_model.joblib"
+    if not ruta.exists():
+        st.error("No se encontró 'vulnerability_model.joblib'. Súbelo al repositorio junto a app.py.")
+        st.stop()
+    return joblib.load(ruta)
+
+
+def parsear_url(url):
+    m = re.search(r"github\.com/([^/\s]+)/([^/\s#?]+)", url)
+    if not m:
+        return None
+    return m.group(1), m.group(2).removesuffix(".git")
+
+
+def descargar(owner, repo, ruta):
+    r = requests.get(f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{ruta}", timeout=15)
+    return r.text if r.status_code == 200 else None
+
+
+def leer_requirements(texto):
+    paquetes = []
+    for linea in texto.splitlines():
+        m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*==\s*([A-Za-z0-9_.\-]+)", linea)
+        if m:
+            paquetes.append((m.group(1), m.group(2), "PyPI"))
+    return paquetes
+
+
+def leer_package_json(texto):
+    paquetes = []
+    try:
+        data = json.loads(texto)
+    except json.JSONDecodeError:
+        return paquetes
+    for seccion in ("dependencies", "devDependencies"):
+        for nombre, ver in data.get(seccion, {}).items():
+            m = re.search(r"\d+(\.\d+)*", str(ver))
+            if m:
+                paquetes.append((nombre, m.group(0), "npm"))
+    return paquetes
+
+
+def consultar_osv(paquetes):
+    queries = [{"package": {"name": n, "ecosystem": e}, "version": v} for n, v, e in paquetes]
+    hallazgos = []
+    for i in range(0, len(queries), 100):
+        lote = queries[i:i + 100]
+        r = requests.post("https://api.osv.dev/v1/querybatch", json={"queries": lote}, timeout=30)
+        r.raise_for_status()
+        for j, res in enumerate(r.json().get("results", [])):
+            for v in res.get("vulns", []):
+                hallazgos.append((paquetes[i + j], v["id"]))
+    return hallazgos
+
+
+def detalle_vuln(vid):
+    r = requests.get(f"https://api.osv.dev/v1/vulns/{vid}", timeout=20)
+    return r.json() if r.status_code == 200 else {}
+
+
+def version_corregida(vuln, nombre):
+    for a in vuln.get("affected", []):
+        if a.get("package", {}).get("name", "").lower() == nombre.lower():
+            for rg in a.get("ranges", []):
+                for ev in rg.get("events", []):
+                    if "fixed" in ev:
+                        return ev["fixed"]
+    return None
+
+
+bundle = cargar_modelo()
 pipeline = bundle["pipeline"]
 le = bundle["label_encoder"]
 num_features = bundle["num_features"]
-cat_features = bundle["cat_features"]
-feature_ranges = bundle["feature_ranges"]
-cat_options = bundle["cat_options"]
-metrics_df = pd.DataFrame(bundle["metrics_summary"])
+defaults = bundle.get("feature_defaults", {})
 
-st.sidebar.header("Parámetros de Entrada")
-user_input = {}
+st.title("🛡️ Escáner de repositorios GitHub (simulación)")
+st.caption(f"Severidad estimada con el modelo entrenado: {bundle['best_model_name']}. "
+           "Las vulnerabilidades conocidas vienen de OSV.dev.")
 
-for col in num_features:
-    min_v, max_v, med_v = feature_ranges[col]
-    if min_v == max_v:
-        max_v = min_v + 10.0
-    user_input[col] = st.sidebar.number_input(col, min_value=float(min_v), max_value=float(max_v * 1.5), value=float(med_v))
+url = st.text_input("URL del repositorio", placeholder="https://github.com/usuario/repositorio")
 
-for col in cat_features:
-    opts = cat_options.get(col) or ["Desconocido"]
-    user_input[col] = st.sidebar.selectbox(col, opts)
+if st.button("Escanear") and url:
+    datos = parsear_url(url)
+    if not datos:
+        st.error("No parece una URL de GitHub válida.")
+        st.stop()
+    owner, repo = datos
 
-tab1, tab2 = st.tabs(["Predicción", "Comparativa de Modelos"])
+    with st.spinner("Descargando archivos de dependencias..."):
+        paquetes = []
+        encontrados = []
+        for ruta, lector in (("requirements.txt", leer_requirements), ("package.json", leer_package_json)):
+            texto = descargar(owner, repo, ruta)
+            if texto:
+                encontrados.append(ruta)
+                paquetes += lector(texto)
 
-with tab1:
-    input_df = pd.DataFrame([user_input])
-    pred_idx = pipeline.predict(input_df)[0]
-    pred_label = le.inverse_transform([pred_idx])[0]
+    if not encontrados:
+        st.warning("No encontré requirements.txt ni package.json en la raíz del repositorio "
+                   "(o el repo es privado).")
+        st.stop()
 
-    st.metric(label=f"Severidad Predicha ({bundle['best_model_name']})", value=str(pred_label))
+    st.write(f"Archivos analizados: {', '.join(encontrados)} | Dependencias con versión fija: {len(paquetes)}")
+    if not paquetes:
+        st.info("Las dependencias no tienen versión fija (==), así que no se pueden comprobar.")
+        st.stop()
 
-    if hasattr(pipeline, "predict_proba"):
-        probs = pipeline.predict_proba(input_df)[0]
-        prob_df = pd.DataFrame({"Severidad": le.classes_, "Probabilidad (%)": np.round(probs * 100, 2)})
-        fig = px.bar(prob_df, x="Probabilidad (%)", y="Severidad", orientation="h", text="Probabilidad (%)")
-        st.plotly_chart(fig, use_container_width=True)
+    with st.spinner("Consultando base de vulnerabilidades..."):
+        try:
+            hallazgos = consultar_osv(paquetes)[:MAX_VULNS]
+        except requests.RequestException as e:
+            st.error(f"No pude consultar OSV.dev: {e}")
+            st.stop()
 
-with tab2:
-    st.dataframe(metrics_df, use_container_width=True)
+        filas = []
+        for (nombre, version, eco), vid in hallazgos:
+            v = detalle_vuln(vid)
+            resumen = v.get("summary") or (v.get("details", "")[:300])
+            texto = f"{resumen} {v.get('details', '')[:500]}".strip()
+            fijo = version_corregida(v, nombre)
+            filas.append({
+                "Paquete": nombre,
+                "Versión actual": version,
+                "ID": vid,
+                "Descripción": resumen,
+                "_texto": texto,
+                "Solución": f"Actualizar {nombre} a {fijo} o superior" if fijo
+                            else "Revisar el aviso y buscar una versión más reciente",
+            })
+
+    if not filas:
+        st.success("No se encontraron vulnerabilidades conocidas en las dependencias analizadas. ✅")
+        st.stop()
+
+    df = pd.DataFrame(filas)
+    entrada = pd.DataFrame({"text": df["_texto"]})
+    for c in num_features:
+        entrada[c] = defaults.get(c)
+    df["Severidad (modelo)"] = le.inverse_transform(pipeline.predict(entrada[["text"] + num_features]))
+    df = df.drop(columns=["_texto"])
+
+    st.error(f"Se encontraron {len(df)} vulnerabilidades")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.bar_chart(df["Severidad (modelo)"].value_counts())
+
+with st.expander("Métricas de los modelos entrenados"):
+    st.dataframe(pd.DataFrame(bundle["metrics_summary"]))
